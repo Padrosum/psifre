@@ -17,6 +17,10 @@ STORE_DIR="${PSIFRE_DIR:-$HOME/.psifre}"
 VERIFY_FILE="$STORE_DIR/.verify"
 VERIFY_TOKEN="psifre-v1-ok"
 BACKUP_MAGIC="PSIFRE-BACKUP-V1"
+BACKUP_MAGIC_V2="PSIFRE-BACKUP-V2"
+AUTH_FAIL_FILE="$STORE_DIR/.auth_fail"
+MAX_AUTH_ATTEMPTS=5
+CLIPBOARD_TTL=45
 MASTER_PASS=""
 SELECTED_LABEL=""
 
@@ -60,23 +64,72 @@ confirm() {
 
 # ── Pano ──────────────────────────────────────
 
-copy_to_clipboard() {
+clear_clipboard() {
   if command -v wl-copy &>/dev/null; then
-    echo -n "$1" | wl-copy 2>/dev/null && return 0
+    wl-copy --clear 2>/dev/null || echo -n "" | wl-copy 2>/dev/null
   elif command -v xclip &>/dev/null; then
-    echo -n "$1" | xclip -selection clipboard 2>/dev/null && return 0
+    echo -n "" | xclip -selection clipboard 2>/dev/null
   elif command -v xsel &>/dev/null; then
-    echo -n "$1" | xsel --clipboard --input 2>/dev/null && return 0
+    echo -n "" | xsel --clipboard --input 2>/dev/null
+  fi
+}
+
+copy_to_clipboard() {
+  local ok=1
+  if command -v wl-copy &>/dev/null; then
+    echo -n "$1" | wl-copy 2>/dev/null && ok=0
+  elif command -v xclip &>/dev/null; then
+    echo -n "$1" | xclip -selection clipboard 2>/dev/null && ok=0
+  elif command -v xsel &>/dev/null; then
+    echo -n "$1" | xsel --clipboard --input 2>/dev/null && ok=0
+  fi
+  if [[ $ok -eq 0 ]]; then
+    (
+      sleep "$CLIPBOARD_TTL"
+      clear_clipboard
+    ) &>/dev/null &
+    disown
+    return 0
   fi
   return 1
 }
 
 # ── Depo ──────────────────────────────────────
 
+recover_store() {
+  local d old
+  for d in "${STORE_DIR}.rekey."*; do
+    [[ -d "$d" ]] && rm -rf "$d"
+  done
+
+  if [[ ! -f "$VERIFY_FILE" ]]; then
+    for old in "${STORE_DIR}.old."*; do
+      if [[ -d "$old" && -f "$old/.verify" ]]; then
+        warn "Yarım kalan anahtar değişimi algılandı; eski depo geri yükleniyor."
+        rm -rf "$STORE_DIR"
+        mv "$old" "$STORE_DIR"
+        break
+      fi
+    done
+  else
+    for old in "${STORE_DIR}.old."*; do
+      [[ -d "$old" ]] && rm -rf "$old"
+    done
+  fi
+}
+
 init_store() {
+  recover_store
   mkdir -p "$STORE_DIR"
   chmod 700 "$STORE_DIR"
 }
+
+cleanup_secrets() {
+  MASTER_PASS=""
+  SELECTED_LABEL=""
+}
+
+trap cleanup_secrets EXIT
 
 # ── Ana parola ────────────────────────────────
 # Güvenlik: VERIFY_FILE içinde hash saklanmaz.
@@ -132,31 +185,98 @@ setup_master() {
 }
 
 verify_master() {
-  local pass
-  ask_secret "Ana parola" pass
+  local attempts=0 pass stored decrypted delay
+  local fail_count=0 fail_ts=0 now
 
-  local stored decrypted
-  stored=$(cat "$VERIFY_FILE")
-  decrypted=$(_decrypt_verify "$pass" "$stored")
-
-  if [[ "$decrypted" != "$VERIFY_TOKEN" ]]; then
-    err "Hatalı ana parola."
-    exit 1
+  if [[ -f "$AUTH_FAIL_FILE" ]]; then
+    # format: count timestamp
+    read -r fail_count fail_ts <"$AUTH_FAIL_FILE" || true
+    fail_count=${fail_count:-0}
+    fail_ts=${fail_ts:-0}
+    now=$(date +%s)
+    if [[ "$fail_count" -ge "$MAX_AUTH_ATTEMPTS" ]]; then
+      delay=$((fail_ts + fail_count * 30 - now))
+      if [[ "$delay" -gt 0 ]]; then
+        err "Çok fazla hatalı deneme. ${delay}s sonra tekrar deneyin."
+        exit 1
+      fi
+      fail_count=0
+    fi
   fi
 
-  MASTER_PASS="$pass"
+  stored=$(cat "$VERIFY_FILE")
+
+  while [[ $attempts -lt $MAX_AUTH_ATTEMPTS ]]; do
+    ask_secret "Ana parola" pass
+    decrypted=$(_decrypt_verify "$pass" "$stored")
+
+    if [[ "$decrypted" == "$VERIFY_TOKEN" ]]; then
+      rm -f "$AUTH_FAIL_FILE"
+      MASTER_PASS="$pass"
+      return 0
+    fi
+
+    attempts=$((attempts + 1))
+    fail_count=$((fail_count + 1))
+    printf '%s %s\n' "$fail_count" "$(date +%s)" >"$AUTH_FAIL_FILE"
+    chmod 600 "$AUTH_FAIL_FILE" 2>/dev/null || true
+
+    err "Hatalı ana parola. (${attempts}/${MAX_AUTH_ATTEMPTS})"
+    sleep $((attempts * 2))
+  done
+
+  err "Erişim engellendi."
+  exit 1
 }
 
 # ── Şifreleme ─────────────────────────────────
+# openssl enc AEAD desteklemez; encrypt-then-MAC (HMAC-SHA256) eklenir.
+# Eski (MAC'siz) kayıtlar okunmaya devam eder.
+
+_b64encode() { printf '%s' "$1" | base64 -w0 2>/dev/null || printf '%s' "$1" | base64; }
+_b64decode() { printf '%s' "$1" | base64 -d 2>/dev/null; }
+
+_hmac() {
+  local pass="$1" data="$2"
+  printf '%s' "$data" | openssl dgst -sha256 -hmac "psifre-mac-v1:${pass}" 2>/dev/null | awk '{print $NF}'
+}
+
+encrypt_data_with() {
+  local pass="$1" data="$2" ct mac
+  ct=$(printf '%s' "$data" | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 \
+    -pass fd:3 -base64 -A 2>/dev/null 3<<<"$pass")
+  [[ -n "$ct" ]] || return 1
+  mac=$(_hmac "$pass" "$ct")
+  [[ -n "$mac" ]] || return 1
+  printf 'v2:%s.%s' "$ct" "$mac"
+}
 
 encrypt_data() {
-  echo -n "$1" | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 \
-    -pass fd:3 -base64 -A 2>/dev/null 3<<<"$MASTER_PASS"
+  encrypt_data_with "$MASTER_PASS" "$1"
+}
+
+decrypt_data_with() {
+  local pass="$1" blob="$2" ct mac expect
+
+  if [[ "$blob" == v2:* ]]; then
+    blob="${blob#v2:}"
+    ct="${blob%.*}"
+    mac="${blob##*.}"
+    expect=$(_hmac "$pass" "$ct")
+    if [[ -z "$expect" || "$mac" != "$expect" ]]; then
+      return 1
+    fi
+    printf '%s' "$ct" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+      -pass fd:3 -base64 -A 2>/dev/null 3<<<"$pass"
+  else
+    # Eski format (MAC yok)
+    printf '%s' "$blob" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+      -pass fd:3 -base64 -A 2>/dev/null 3<<<"$pass"
+  fi
 }
 
 decrypt_data() {
-  echo "$1" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-    -pass fd:3 -base64 -A 2>/dev/null 3<<<"$MASTER_PASS"
+  decrypt_data_with "$MASTER_PASS" "$1"
 }
 
 # ── Parola üreteci ────────────────────────────
@@ -187,6 +307,32 @@ password_strength() {
 }
 
 # ── Kayıt G/Ç ────────────────────────────────
+# Dosya adı: '_' kaçışlı etiket ( '_' → '__', boşluk → '_' ).
+# Eski naive boşluk→'_' dosyaları unlock sonrası migrate edilir.
+
+fn_encode() {
+  local s="${1//_/__}"
+  printf '%s' "${s// /_}"
+}
+
+fn_decode() {
+  local s="$1" out="" i=0
+  while ((i < ${#s})); do
+    if [[ "${s:i:1}" == "_" ]]; then
+      if [[ "${s:i:2}" == "__" ]]; then
+        out+="_"
+        ((i += 2))
+      else
+        out+=" "
+        ((i++))
+      fi
+    else
+      out+="${s:i:1}"
+      ((i++))
+    fi
+  done
+  printf '%s' "$out"
+}
 
 validate_label() {
   local label="$1"
@@ -204,15 +350,27 @@ validate_label() {
   fi
 }
 
-entry_file() { echo "$STORE_DIR/${1// /_}.enc"; }
+entry_file() { echo "$STORE_DIR/$(fn_encode "$1").enc"; }
+
+# Eski naive eşleme (yalnızca boşluk → '_') — geriye dönük okuma
+entry_file_legacy() { echo "$STORE_DIR/${1// /_}.enc"; }
+
+entry_exists() {
+  [[ -f "$(entry_file "$1")" || -f "$(entry_file_legacy "$1")" ]]
+}
 
 save_entry() {
   local label="$1" password="$2" url="${3:-}" note="${4:-}"
   local file payload encrypted
 
   file=$(entry_file "$label")
-  payload=$(printf "label=%s\npassword=%s\nurl=%s\nnote=%s\ndate=%s" \
-    "$label" "$password" "$url" "$note" "$(date '+%Y-%m-%d %H:%M')")
+  # v=2: alan değerleri base64 — satır sonu / enjeksiyon güvenli
+  payload=$(printf "v=2\nlabel=%s\npassword=%s\nurl=%s\nnote=%s\ndate=%s" \
+    "$(_b64encode "$label")" \
+    "$(_b64encode "$password")" \
+    "$(_b64encode "$url")" \
+    "$(_b64encode "$note")" \
+    "$(_b64encode "$(date '+%Y-%m-%d %H:%M')")")
 
   encrypted=$(encrypt_data "$payload")
   if [[ -z "$encrypted" ]]; then
@@ -230,6 +388,9 @@ load_entry() {
 
   file=$(entry_file "$label")
   if [[ ! -f "$file" ]]; then
+    file=$(entry_file_legacy "$label")
+  fi
+  if [[ ! -f "$file" ]]; then
     err "Kayıt bulunamadı: '$label'"
     return 1
   fi
@@ -237,7 +398,7 @@ load_entry() {
   raw=$(cat "$file")
   decrypted=$(decrypt_data "$raw")
   if [[ -z "$decrypted" ]]; then
-    err "Şifre çözme başarısız."
+    err "Şifre çözme başarısız (bozuk veya değiştirilmiş kayıt)."
     return 1
   fi
 
@@ -245,13 +406,53 @@ load_entry() {
 }
 
 list_labels() {
-  local f
+  local f name
   for f in "$STORE_DIR"/*.enc; do
-    [[ -f "$f" ]] && basename "$f" .enc | tr '_' ' '
+    [[ -f "$f" ]] || continue
+    name=$(basename "$f" .enc)
+    fn_decode "$name"
+    printf '\n'
   done
 }
 
-get_field() { echo "$1" | grep "^${2}=" | cut -d= -f2-; }
+get_field() {
+  local raw="$1" key="$2" line val
+  line=$(printf '%s\n' "$raw" | grep "^${key}=" | head -n1) || true
+  val="${line#${key}=}"
+  if printf '%s\n' "$raw" | head -n1 | grep -qx 'v=2'; then
+    _b64decode "$val"
+  else
+    printf '%s' "$val"
+  fi
+}
+
+# Unlock sonrası: dosya adlarını çakışmasız şemaya taşı
+migrate_entry_filenames() {
+  local f raw label target
+  for f in "$STORE_DIR"/*.enc; do
+    [[ -f "$f" ]] || continue
+    raw=$(decrypt_data "$(cat "$f")") || continue
+    [[ -n "$raw" ]] || continue
+    label=$(get_field "$raw" "label")
+    [[ -n "$label" ]] || continue
+    target=$(entry_file "$label")
+    if [[ "$f" != "$target" ]]; then
+      if [[ -e "$target" ]]; then
+        # Hedef dolu: hedef gerçekten bu etiket mi?
+        local other_raw other_label
+        other_raw=$(decrypt_data "$(cat "$target")") || true
+        other_label=$(get_field "$other_raw" "label")
+        if [[ "$other_label" == "$label" ]]; then
+          rm -f "$f"
+        else
+          warn "Dosya adı çakışması atlandı: '$label'"
+        fi
+      else
+        mv "$f" "$target"
+      fi
+    fi
+  done
+}
 
 # ── Kayıt seçici (global değişken kullanır) ───
 # NEDEN: $(resolve_label) gibi komut ikamesi kullanılırsa
@@ -311,9 +512,7 @@ do_generate() {
   }
   validate_label "$label" || return
 
-  local file
-  file=$(entry_file "$label")
-  if [[ -f "$file" ]]; then
+  if entry_exists "$label"; then
     confirm "'${label}' zaten var. Üzerine yazılsın mı?" || return
   fi
 
@@ -361,7 +560,7 @@ do_generate() {
   success "Kaydedildi: '${label}'"
 
   if copy_to_clipboard "$password"; then
-    success "Panoya kopyalandı."
+    success "Panoya kopyalandı (${CLIPBOARD_TTL}s sonra temizlenir)."
   fi
 }
 
@@ -379,9 +578,7 @@ do_import() {
   }
   validate_label "$label" || return
 
-  local file
-  file=$(entry_file "$label")
-  if [[ -f "$file" ]]; then
+  if entry_exists "$label"; then
     confirm "'${label}' zaten var. Üzerine yazılsın mı?" || return
   fi
 
@@ -454,7 +651,7 @@ do_show() {
   echo
 
   if copy_to_clipboard "$pw"; then
-    success "Panoya kopyalandı."
+    success "Panoya kopyalandı (${CLIPBOARD_TTL}s sonra temizlenir)."
   fi
 }
 
@@ -469,6 +666,9 @@ do_delete() {
   local file
   file=$(entry_file "$label")
   if [[ ! -f "$file" ]]; then
+    file=$(entry_file_legacy "$label")
+  fi
+  if [[ ! -f "$file" ]]; then
     err "Kayıt bulunamadı."
     return
   fi
@@ -477,7 +677,7 @@ do_delete() {
     warn "İptal edildi."
     return
   }
-  rm -f "$file"
+  rm -f "$file" "$(entry_file "$label")" "$(entry_file_legacy "$label")"
   success "'${label}' silindi."
 }
 
@@ -516,49 +716,66 @@ do_change_master() {
     return
   fi
 
-  # Önce tümünü geçici .new dosyalarına şifrele; hepsi başarılıysa yer değiştir
-  local tmp_pairs=() failed=0
+  # Paralel depo: tüm kayıtlar + verify hazırlanınca dizin atomik değiştirilir
+  local new_store old_store
+  new_store=$(mktemp -d "${STORE_DIR}.rekey.XXXXXX") || {
+    err "Geçici depo oluşturulamadı."
+    return
+  }
+  chmod 700 "$new_store"
+
+  local label failed=0
   for label in "${!raw_map[@]}"; do
     local raw="${raw_map[$label]}"
-    local pw url note
+    local pw url note payload encrypted dest
     pw=$(get_field "$raw" "password")
     url=$(get_field "$raw" "url")
     note=$(get_field "$raw" "note")
 
-    local file tmp payload encrypted
-    file=$(entry_file "$label")
-    tmp="${file}.new"
-    payload=$(printf "label=%s\npassword=%s\nurl=%s\nnote=%s\ndate=%s" \
-      "$label" "$pw" "$url" "$note" "$(date '+%Y-%m-%d %H:%M')")
-    encrypted=$(echo -n "$payload" | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 \
-      -pass fd:3 -base64 -A 2>/dev/null 3<<<"$new1")
-
+    payload=$(printf "v=2\nlabel=%s\npassword=%s\nurl=%s\nnote=%s\ndate=%s" \
+      "$(_b64encode "$label")" \
+      "$(_b64encode "$pw")" \
+      "$(_b64encode "$url")" \
+      "$(_b64encode "$note")" \
+      "$(_b64encode "$(date '+%Y-%m-%d %H:%M')")")
+    encrypted=$(encrypt_data_with "$new1" "$payload")
     if [[ -z "$encrypted" ]]; then
       failed=1
       break
     fi
-    echo "$encrypted" >"$tmp"
-    chmod 600 "$tmp"
-    tmp_pairs+=("$tmp" "$file")
+    dest="$new_store/$(fn_encode "$label").enc"
+    echo "$encrypted" >"$dest"
+    chmod 600 "$dest"
   done
 
   if [[ $failed -eq 1 ]]; then
-    for f in "${tmp_pairs[@]}"; do [[ "$f" == *.new ]] && rm -f "$f"; done
+    rm -rf "$new_store"
     err "Şifreleme başarısız, hiçbir değişiklik uygulanmadı."
     return
   fi
 
-  # Tüm geçici dosyalar hazır — şimdi atomik olarak uygula
   local token
   token=$(_encrypt_verify "$new1")
-  echo "$token" >"$VERIFY_FILE"
-  chmod 600 "$VERIFY_FILE"
+  if [[ -z "$token" ]]; then
+    rm -rf "$new_store"
+    err "Doğrulama dosyası oluşturulamadı."
+    return
+  fi
+  echo "$token" >"$new_store/.verify"
+  chmod 600 "$new_store/.verify"
 
-  local i=0
-  while [[ $i -lt ${#tmp_pairs[@]} ]]; do
-    mv "${tmp_pairs[$i]}" "${tmp_pairs[$((i + 1))]}"
-    ((i += 2))
-  done
+  old_store="${STORE_DIR}.old.$$"
+  if ! mv "$STORE_DIR" "$old_store"; then
+    rm -rf "$new_store"
+    err "Depo taşınamadı, değişiklik uygulanmadı."
+    return
+  fi
+  if ! mv "$new_store" "$STORE_DIR"; then
+    mv "$old_store" "$STORE_DIR" 2>/dev/null || true
+    err "Yeni depo etkinleştirilemedi; eski depo geri yüklendi."
+    return
+  fi
+  rm -rf "$old_store"
 
   MASTER_PASS="$new1"
   success "Ana parola değiştirildi. Tüm kayıtlar yeniden şifrelendi."
@@ -596,19 +813,16 @@ do_backup() {
     backup_plain+="${encoded}"$'\n'
   done
 
-  # Tüm içeriği tek seferde şifrele
+  # Tüm içeriği tek seferde şifrele + MAC (encrypt_data)
   local encrypted
-  encrypted=$(printf '%s' "$backup_plain" |
-    openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -pass fd:3 2>/dev/null \
-      3<<<"$MASTER_PASS" |
-    base64 -w 0)
+  encrypted=$(encrypt_data "$backup_plain")
 
   if [[ -z "$encrypted" ]]; then
     err "Şifreleme başarısız."
     return
   fi
 
-  printf '%s\n%s\n' "$BACKUP_MAGIC" "$encrypted" >"$out_path"
+  printf '%s\n%s\n' "$BACKUP_MAGIC_V2" "$encrypted" >"$out_path"
   chmod 600 "$out_path"
 
   echo
@@ -638,7 +852,7 @@ do_restore() {
   # Dosya türünü doğrula
   local magic
   magic=$(head -1 "$bak_path")
-  if [[ "$magic" != "$BACKUP_MAGIC" ]]; then
+  if [[ "$magic" != "$BACKUP_MAGIC" && "$magic" != "$BACKUP_MAGIC_V2" ]]; then
     err "Geçersiz ya da bozuk yedek dosyası."
     return
   fi
@@ -646,13 +860,18 @@ do_restore() {
   local bak_pass
   ask_secret "Yedeğin ana parolası (kaynak bilgisayar)" bak_pass
 
-  # Şifre çöz: base64 → ikili → openssl decrypt
   local encrypted plaintext
   encrypted=$(tail -n +2 "$bak_path")
-  plaintext=$(printf '%s' "$encrypted" |
-    base64 -d |
-    openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass fd:3 2>/dev/null \
-      3<<<"$bak_pass")
+
+  if [[ "$magic" == "$BACKUP_MAGIC_V2" ]]; then
+    plaintext=$(decrypt_data_with "$bak_pass" "$encrypted")
+  else
+    # Eski V1: binary openssl çıktısı + base64, MAC yok
+    plaintext=$(printf '%s' "$encrypted" |
+      base64 -d |
+      openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass fd:3 2>/dev/null \
+        3<<<"$bak_pass")
+  fi
 
   if [[ -z "$plaintext" ]]; then
     err "Şifre çözme başarısız. Parola yanlış ya da dosya bozuk olabilir."
@@ -687,7 +906,7 @@ do_restore() {
 
     local file
     file=$(entry_file "$label")
-    if [[ -f "$file" ]]; then
+    if entry_exists "$label"; then
       echo -en "  ${YELLOW}!${NC} '${label}' zaten var — üzerine yazılsın mı? [e/H]: "
       read -r _ow
       if [[ "$_ow" =~ ^[EeYy]$ ]]; then
@@ -772,6 +991,8 @@ main() {
     verify_master
     success "Erişim sağlandı."
   fi
+
+  migrate_entry_filenames
 
   main_menu
 }
